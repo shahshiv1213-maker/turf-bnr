@@ -2,7 +2,8 @@ import json
 import os
 import secrets
 import re
-from datetime import date
+import time
+from datetime import date, datetime, timedelta, timezone
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -27,6 +28,11 @@ def load_local_env():
 
 load_local_env()
 app = Flask(__name__)
+
+
+def nepal_today():
+    """Today's date in Nepal (UTC+5:45). Vercel servers run in UTC, so a plain 'today' can be a day behind."""
+    return datetime.now(timezone(timedelta(hours=5, minutes=45))).date()
 
 VENUES = [
     {"id": "jnl-futsal", "name": "JNL Futsal", "area": "Swagatam Marg", "address": "F73P+H9H, Swagatam Marg, Biratnagar, Koshi Province 56613", "phone": "986-2170872", "price": 0, "hours": "7:00 AM–10:00 PM", "facilities": ["Hourly slots", "Open daily"]},
@@ -58,23 +64,30 @@ def supabase_request(method, path, body=None, extra_headers=None):
     if extra_headers:
         headers.update(extra_headers)
     data = json.dumps(body).encode("utf-8") if body is not None else None
-    req = Request(f"{base_url}/rest/v1/{path}", data=data, headers=headers, method=method)
-    try:
-        with urlopen(req, timeout=12) as response:
-            raw = response.read().decode("utf-8")
-            try:
-                return response.status, json.loads(raw) if raw else None
-            except json.JSONDecodeError:
-                return 502, {"message": "Supabase returned an unexpected response."}
-    except HTTPError as error:
-        raw = error.read().decode("utf-8")
+    # Reads are safe to retry if the network hiccups. Writes are tried once, so a booking is never saved twice.
+    attempts = 3 if method == "GET" else 1
+    last_error = None
+    for attempt in range(attempts):
+        req = Request(f"{base_url}/rest/v1/{path}", data=data, headers=headers, method=method)
         try:
-            detail = json.loads(raw)
-        except json.JSONDecodeError:
-            detail = {"message": raw or "Database request failed"}
-        return error.code, detail
-    except URLError as error:
-        return 502, {"message": f"Could not reach Supabase: {error.reason}"}
+            with urlopen(req, timeout=12) as response:
+                raw = response.read().decode("utf-8")
+                try:
+                    return response.status, json.loads(raw) if raw else None
+                except json.JSONDecodeError:
+                    return 502, {"message": "Supabase returned an unexpected response."}
+        except HTTPError as error:
+            raw = error.read().decode("utf-8")
+            try:
+                detail = json.loads(raw)
+            except json.JSONDecodeError:
+                detail = {"message": raw or "Database request failed"}
+            return error.code, detail
+        except URLError as error:
+            last_error = error
+            if attempt < attempts - 1:
+                time.sleep(0.4 * (attempt + 1))
+    return 502, {"message": f"Could not reach Supabase: {last_error.reason}"}
 
 
 def owner_allowed():
@@ -90,7 +103,7 @@ def home():
 
 @app.get("/api/venues")
 def venues():
-    return jsonify({"venues": VENUES, "slots": SLOTS, "today": date.today().isoformat()})
+    return jsonify({"venues": VENUES, "slots": SLOTS, "today": nepal_today().isoformat()})
 
 
 @app.get("/style.css")
@@ -105,16 +118,19 @@ def script():
 
 @app.get("/api/bookings")
 def public_bookings():
-    booking_date = request.args.get("date", date.today().isoformat())
+    booking_date = request.args.get("date", nepal_today().isoformat())
     venue_id = request.args.get("venue_id", "")
-    if venue_id not in VENUE_BY_ID:
+    if venue_id and venue_id not in VENUE_BY_ID:
         return jsonify({"error": "Choose a valid futsal."}), 400
-    query = urlencode({"select": "venue_id,booking_date,start_time", "venue_id": f"eq.{venue_id}", "booking_date": f"eq.{booking_date}", "status": "in.(confirmed,held)"})
+    filters = {"select": "venue_id,booking_date,start_time", "booking_date": f"eq.{booking_date}", "status": "in.(confirmed,held)"}
+    if venue_id:  # no venue_id = all futsals for that date, in ONE database call
+        filters["venue_id"] = f"eq.{venue_id}"
+    query = urlencode(filters)
     try:
         status, data = supabase_request("GET", f"bookings?{query}")
     except RuntimeError as error:
-        # Preview mode keeps the local design usable before database secrets are added.
-        return jsonify([])
+        # Never pretend every slot is free when the database is not connected.
+        return jsonify({"error": str(error)}), 503
     if status >= 400:
         message = data.get("message") if isinstance(data, dict) else None
         return jsonify({"error": message or "Could not load bookings."}), 502
@@ -140,7 +156,7 @@ def create_booking():
         requested_date = date.fromisoformat(booking_date)
     except ValueError:
         return jsonify({"error": "Choose a valid booking date."}), 400
-    if requested_date < date.today():
+    if requested_date < nepal_today():
         return jsonify({"error": "Bookings cannot be made for a past date."}), 400
 
     record = {
