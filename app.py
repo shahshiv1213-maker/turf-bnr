@@ -2,6 +2,7 @@ import json
 import os
 import secrets
 import re
+import socket
 import time
 from datetime import date, datetime, timedelta, timezone
 from urllib.error import HTTPError, URLError
@@ -45,14 +46,24 @@ VENUE_BY_ID = {venue["id"]: venue for venue in VENUES}
 SLOTS = [{"start": f"{hour:02d}:00", "end": f"{hour + 1:02d}:00"} for hour in range(7, 22)]
 
 
+def clean_setting(value):
+    """Remove spaces, line breaks and quotes that sneak in when a value is pasted."""
+    return value.strip().strip('"').strip("'").strip()
+
+
 def supabase_request(method, path, body=None, extra_headers=None):
     """Make a server-side request. The service key never reaches the browser."""
-    base_url = os.environ.get("SUPABASE_URL", "").rstrip("/")
+    # Pasted values often carry hidden spaces, quotes or line breaks, so clean them first.
+    base_url = clean_setting(os.environ.get("SUPABASE_URL", "")).rstrip("/")
+    if base_url.endswith("/rest/v1"):
+        base_url = base_url[: -len("/rest/v1")]
     # The current Supabase secret key stays on this Flask server only.
     # The legacy variable name is accepted temporarily for older projects.
-    service_key = os.environ.get("SUPABASE_SECRET_KEY") or os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+    service_key = clean_setting(os.environ.get("SUPABASE_SECRET_KEY") or os.environ.get("SUPABASE_SERVICE_ROLE_KEY", ""))
     if not base_url or not service_key:
         raise RuntimeError("Database is not configured. Add Supabase environment variables.")
+    if not re.fullmatch(r"https?://[A-Za-z0-9.-]+(:\d+)?", base_url):
+        raise RuntimeError("SUPABASE_URL is not a valid web address. It must look like https://xxxx.supabase.co")
 
     headers = {
         "apikey": service_key,
@@ -87,7 +98,13 @@ def supabase_request(method, path, body=None, extra_headers=None):
             last_error = error
             if attempt < attempts - 1:
                 time.sleep(0.4 * (attempt + 1))
-    return 502, {"message": f"Could not reach Supabase: {last_error.reason}"}
+    reason = last_error.reason
+    not_found = isinstance(reason, socket.gaierror) or (isinstance(reason, OSError) and reason.errno in (16, -2, -3, -5))
+    if not_found:
+        # On Vercel, "can't find this address" is reported as "[Errno 16] Device or resource busy".
+        host = base_url.split("://", 1)[-1]
+        return 502, {"message": f"Cannot find the database address (starts with '{host[:4]}', {len(base_url)} characters). Check SUPABASE_URL in Vercel."}
+    return 502, {"message": f"Could not reach Supabase: {reason}"}
 
 
 def owner_allowed():
